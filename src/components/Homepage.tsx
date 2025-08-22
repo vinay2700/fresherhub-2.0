@@ -28,7 +28,7 @@ const Homepage: React.FC<HomepageProps> = ({ onNavigate }) => {
   const [locationQuery, setLocationQuery] = useState('');
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [guestCreditUsed, setGuestCreditUsed] = useState(false);
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, credits, resetTime } = useAuth();
 
   // Check guest credit status on component mount and when returning to homepage
   React.useEffect(() => {
@@ -60,8 +60,8 @@ const Homepage: React.FC<HomepageProps> = ({ onNavigate }) => {
   };
 
   const creditsInfo = {
-    credits: isAuthenticated ? 5 : (guestCreditUsed ? 0 : 1),
-    resetTime: null
+    credits: isAuthenticated ? credits : (guestCreditUsed ? 0 : 1),
+    resetTime: resetTime
   };
 
   return (

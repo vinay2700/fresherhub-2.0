@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Zap, Clock, User, LogIn, AlertCircle } from 'lucide-react';
-import { authService, User as AuthUser } from '../services/authService';
+import { useAuth } from '../hooks/useAuth';
 import AuthModal from './AuthModal';
 
 interface CreditSystemProps {
@@ -9,41 +9,33 @@ interface CreditSystemProps {
 }
 
 const CreditSystem: React.FC<CreditSystemProps> = ({ onAuthRequired, showSignInButton = true }) => {
-  const [user, setUser] = useState<AuthUser | null>(null);
-  const [guestCredits, setGuestCredits] = useState(0);
+  const { credits, resetTime, loading, isAuthenticated } = useAuth();
+  const [guestCredits, setGuestCredits] = useState(1);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [timeUntilReset, setTimeUntilReset] = useState('');
-  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    loadUserData();
-    const interval = setInterval(loadUserData, 60000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const loadUserData = async () => {
-    setLoading(true);
-    const currentUser = await authService.getCurrentUser();
-    if (currentUser) {
-      setUser(currentUser);
-      setGuestCredits(0);
-      updateResetTimer(currentUser.credits_reset_at);
-    } else {
-      const credits = await authService.getGuestCredits();
-      setGuestCredits(credits);
-      setUser(null);
+    if (!isAuthenticated) {
+      const used = localStorage.getItem('fresherhub_guest_used');
+      setGuestCredits(used ? 0 : 1);
     }
-    setLoading(false);
-  };
+  }, [isAuthenticated]);
 
-  const updateResetTimer = (resetTime: string) => {
+  useEffect(() => {
+    if (resetTime) {
+      updateResetTimer(resetTime);
+      const interval = setInterval(() => updateResetTimer(resetTime), 60000);
+      return () => clearInterval(interval);
+    }
+  }, [resetTime]);
+
+  const updateResetTimer = (resetTimeStr: string) => {
     const now = new Date();
-    const reset = new Date(resetTime);
+    const reset = new Date(resetTimeStr);
     const diff = reset.getTime() - now.getTime();
     
     if (diff <= 0) {
       setTimeUntilReset('Resetting...');
-      loadUserData();
       return;
     }
 
@@ -57,16 +49,7 @@ const CreditSystem: React.FC<CreditSystemProps> = ({ onAuthRequired, showSignInB
   };
 
   const handleAuthSuccess = () => {
-    loadUserData();
     if (onAuthRequired) onAuthRequired();
-  };
-
-  const hasCredits = () => {
-    return user ? user.credits > 0 : guestCredits > 0;
-  };
-
-  const getTotalCredits = () => {
-    return user ? user.credits : guestCredits;
   };
 
   if (loading) {
@@ -77,11 +60,11 @@ const CreditSystem: React.FC<CreditSystemProps> = ({ onAuthRequired, showSignInB
     );
   }
 
-  if (user) {
+  if (isAuthenticated) {
     return (
       <>
         <div className={`px-4 py-3 rounded-lg shadow-lg ${
-          user.credits > 0 
+          credits > 0 
             ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white' 
             : 'bg-gradient-to-r from-red-500 to-orange-500 text-white'
         }`}>
@@ -92,7 +75,7 @@ const CreditSystem: React.FC<CreditSystemProps> = ({ onAuthRequired, showSignInB
               </div>
               <div>
                 <div className="font-semibold">
-                  {user.credits} AI Credits Remaining
+                  {credits} AI Credits Remaining
                 </div>
                 <div className="text-blue-100 text-sm flex items-center gap-1">
                   <Clock className="h-3 w-3" />
@@ -102,7 +85,7 @@ const CreditSystem: React.FC<CreditSystemProps> = ({ onAuthRequired, showSignInB
             </div>
             <div className="flex items-center gap-2 text-blue-100">
               <User className="h-4 w-4" />
-              <span className="text-sm">{user.name}</span>
+              <span className="text-sm">User</span>
             </div>
           </div>
         </div>

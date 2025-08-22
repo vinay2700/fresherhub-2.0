@@ -9,7 +9,7 @@ import {
   Shield,
   Clock
 } from 'lucide-react';
-import { useAuth } from '../../hooks/useAuth';
+import { sendPasswordReset } from '../../services/authService';
 
 interface ForgotPasswordFormProps {
   onBack: () => void;
@@ -26,7 +26,7 @@ const ForgotPasswordForm: React.FC<ForgotPasswordFormProps> = ({
   const [email, setEmail] = useState('');
   const [emailError, setEmailError] = useState('');
 
-  const { resetPassword } = useAuth();
+  // Using auth service
 
   const validateEmail = (email: string) => {
     if (!email.trim()) {
@@ -61,12 +61,12 @@ const ForgotPasswordForm: React.FC<ForgotPasswordFormProps> = ({
     setSuccess('');
 
     try {
-      const { error } = await resetPassword(email);
+      const result = await sendPasswordReset(email);
       
-      if (error) {
-        setError(error.message || 'Failed to send reset email. Please try again.');
+      if (!result.success) {
+        setError(result.message);
       } else {
-        setSuccess('Password reset email sent! Check your inbox for further instructions.');
+        setSuccess(result.message);
       }
     } catch (err: any) {
       setError('An unexpected error occurred. Please try again.');

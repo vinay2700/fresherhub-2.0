@@ -13,7 +13,7 @@ import {
   Shield,
   Zap
 } from 'lucide-react';
-import { useAuth } from '../../hooks/useAuth';
+import { signInUser } from '../../services/authService';
 
 interface SignInFormProps {
   onBack: () => void;
@@ -38,7 +38,7 @@ const SignInForm: React.FC<SignInFormProps> = ({
   });
   const [fieldErrors, setFieldErrors] = useState<{[key: string]: string}>({});
 
-  const { signIn } = useAuth();
+  // Using auth service
 
   const validateField = (field: string, value: string) => {
     const errors: {[key: string]: string} = {};
@@ -95,23 +95,16 @@ const SignInForm: React.FC<SignInFormProps> = ({
     setSuccess('');
 
     try {
-      const result = await signIn(formData.email, formData.password);
+      const result = await signInUser(formData.email, formData.password);
       
-      if (result.error) {
-        // Enhanced error handling
-        let errorMessage = result.error.message;
-        
-        if (errorMessage.includes('Invalid login credentials') || errorMessage.includes('invalid_credentials')) {
-          errorMessage = 'Invalid email or password. Please check your credentials and try again.';
-        } else if (errorMessage.includes('Email not confirmed')) {
-          errorMessage = 'Please check your email and click the confirmation link before signing in.';
-        } else if (errorMessage.includes('Too many requests')) {
-          errorMessage = 'Too many sign-in attempts. Please wait a few minutes before trying again.';
-        } else if (errorMessage.includes('User not found')) {
-          errorMessage = 'No account found with this email. Please sign up first.';
+      if (!result.success) {
+        if (result.code === 'INVALID_CREDENTIALS') {
+          setError('Invalid login credentials');
+        } else if (result.code === 'EMAIL_NOT_CONFIRMED') {
+          setError('Please confirm your email to continue.');
+        } else {
+          setError(result.message);
         }
-        
-        setError(errorMessage);
       } else {
         setSuccess('Welcome back! Redirecting to your dashboard...');
         setTimeout(() => {
@@ -228,12 +221,6 @@ const SignInForm: React.FC<SignInFormProps> = ({
               <div>
                 <h4 className="text-red-800 font-semibold text-sm">Sign in failed</h4>
                 <p className="text-red-700 text-sm mt-1">{error}</p>
-                {error.includes('confirmation') && (
-                  <div className="mt-3 p-3 bg-white rounded-lg border border-red-200">
-                    <p className="text-red-800 text-xs font-medium">📧 Email not confirmed?</p>
-                    <p className="text-red-700 text-xs">Check your inbox and click the confirmation link first.</p>
-                  </div>
-                )}
               </div>
             </div>
           </div>

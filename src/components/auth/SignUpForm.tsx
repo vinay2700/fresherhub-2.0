@@ -18,7 +18,7 @@ import {
   Sparkles,
   ArrowRight
 } from 'lucide-react';
-import { useAdvancedAuth } from '../../hooks/useAdvancedAuth';
+import { signUpUser } from '../../services/authService';
 
 interface SignUpFormProps {
   onBack: () => void;
@@ -45,7 +45,7 @@ const SignUpForm: React.FC<SignUpFormProps> = ({
   const [fieldErrors, setFieldErrors] = useState<{[key: string]: string}>({});
   const [passwordStrength, setPasswordStrength] = useState(0);
 
-  const { signUp } = useAdvancedAuth();
+  // Using auth service
 
   const calculatePasswordStrength = (password: string) => {
     let strength = 0;
@@ -149,28 +149,16 @@ const SignUpForm: React.FC<SignUpFormProps> = ({
     setSuccess('');
 
     try {
-      const { data, error } = await signUp(formData.email, formData.password, formData.name);
+      const result = await signUpUser(formData.email, formData.password);
       
-      if (error) {
-        let errorMessage = error.message;
-        
-        if (errorMessage.includes('User already registered') || errorMessage.includes('already been registered')) {
-          errorMessage = 'An account with this email already exists. Please sign in instead.';
-        } else if (errorMessage.includes('Password should be at least')) {
-          errorMessage = 'Password must be at least 6 characters long.';
-        } else if (errorMessage.includes('Invalid email')) {
-          errorMessage = 'Please enter a valid email address.';
-        }
-        
-        setError(errorMessage);
-        
-        // If email already exists, show special UI
-        if (error.code === 'EMAIL_ALREADY_EXISTS') {
-          setSuccess('ACCOUNT_EXISTS');
-          return;
+      if (!result.success) {
+        if (result.code === 'EMAIL_ALREADY_REGISTERED') {
+          setError('Email is already registered.');
+        } else {
+          setError(result.message);
         }
       } else {
-        setSuccess('Account created successfully! Please check your email to confirm your account, then sign in.');
+        setSuccess('Check your email to confirm your account.');
         setFormData({
           name: '',
           email: '',
@@ -218,12 +206,20 @@ const SignUpForm: React.FC<SignUpFormProps> = ({
           
           {/* Success Message */}
           <div className="mb-8">
-            <h3 className="text-3xl font-bold text-gray-900 mb-3">
+            <h3 className="text-3xl font-bold text-gray-900 mb-4">
               🎉 Account Created Successfully!
             </h3>
-            <p className="text-lg text-gray-600 mb-6">
-              Welcome to FresherHub! Your account has been created with email:
-            </p>
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-6 mb-6">
+              <div className="flex items-center mb-3">
+                <Mail className="h-5 w-5 text-blue-600 mr-2" />
+                <p className="text-blue-800 font-semibold text-lg">Please verify your email before signing in</p>
+              </div>
+              <p className="text-blue-700 text-sm mb-3">We've sent a confirmation email to:</p>
+              <div className="bg-white border border-blue-300 rounded-lg p-3 mb-3">
+                <p className="text-blue-900 font-semibold text-center">{formData.email}</p>
+              </div>
+              <p className="text-blue-700 text-sm">Click the verification link in the email to activate your account, then return here to sign in.</p>
+            </div>
             <div className="inline-flex items-center px-4 py-2 bg-blue-50 border border-blue-200 rounded-lg">
               <Mail className="h-4 w-4 text-blue-600 mr-2" />
               <span className="font-semibold text-blue-800">{formData.email}</span>

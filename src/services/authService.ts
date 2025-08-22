@@ -1,522 +1,251 @@
-import { supabase } from './supabaseService';
+import { supabase } from '../supabaseClient';
 
-export interface User {
-  id: string;
-  email: string;
-  name: string;
-  avatar_url?: string;
-  credits: number;
-  credits_reset_at: string | null;
-  created_at: string;
-  last_login: string;
-  profile_completed: boolean;
-  subscription_type: 'free' | 'premium';
+/** ───────────────────────────────────────────────────────────────
+ * Types & Utilities
+ * ─────────────────────────────────────────────────────────────── */
+
+export type AuthErrorCode =
+  | "INVALID_CREDENTIALS"
+  | "EMAIL_ALREADY_REGISTERED"
+  | "EMAIL_NOT_CONFIRMED"
+  | "RATE_LIMITED"
+  | "NETWORK"
+  | "LINK_EXPIRED_OR_INVALID"
+  | "WEAK_PASSWORD"
+  | "INVALID_EMAIL"
+  | "UNKNOWN";
+
+export type AuthResult<T = unknown> =
+  | { success: true; message?: string; data?: T }
+  | { success: false; code: AuthErrorCode; message: string; raw?: unknown };
+
+const isValidEmail = (email: string) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+const isStrongPassword = (pwd: string) =>
+  // Example: ≥ 8 chars (add your own rules if needed)
+  typeof pwd === "string" && pwd.length >= 8;
+
+function normalizeError(err: any): { code: AuthErrorCode; message: string } {
+  // Supabase AuthError shape: { message: string; status?: number; name?: string }
+  const msg = (err?.message || "").toString().toLowerCase();
+  const status = Number(err?.status) || 0;
+
+  if (status === 429 || msg.includes("too many requests")) {
+    return { code: "RATE_LIMITED", message: "Too many attempts. Try again later." };
+  }
+  if (msg.includes("invalid login credentials") || msg.includes("invalid credentials")) {
+    return { code: "INVALID_CREDENTIALS", message: "Invalid login credentials." };
+  }
+  if (msg.includes("email not confirmed") || msg.includes("confirm your email")) {
+    return { code: "EMAIL_NOT_CONFIRMED", message: "Please confirm your email to continue." };
+  }
+  if (msg.includes("already registered") || msg.includes("user already exists") || msg.includes("email already in use")) {
+    return { code: "EMAIL_ALREADY_REGISTERED", message: "Email is already registered." };
+  }
+  if (msg.includes("reset token is invalid") || msg.includes("token expired") || msg.includes("invalid or expired")) {
+    return { code: "LINK_EXPIRED_OR_INVALID", message: "This link is invalid or has expired." };
+  }
+  if (msg.includes("password should be at least") || msg.includes("password too short")) {
+    return { code: "WEAK_PASSWORD", message: "Password is too weak. Use at least 8 characters." };
+  }
+  if (msg.includes("network") || status === 0) {
+    return { code: "NETWORK", message: "Network error. Check your connection and try again." };
+  }
+  return { code: "UNKNOWN", message: err?.message || "Something went wrong." };
 }
 
-export interface AuthUser {
-  id: string;
-  email: string | undefined;
-  user_metadata?: {
-    full_name?: string;
-    name?: string;
-    avatar_url?: string;
-  };
+/** Optional: retry wrapper for transient errors (network/429) */
+async function withRetry<T>(fn: () => Promise<T>, times = 2, baseDelayMs = 400): Promise<T> {
+  let lastErr: any;
+  for (let i = 0; i <= times; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      const msg = (err?.message || "").toLowerCase();
+      const status = Number(err?.status) || 0;
+      const transient = status === 429 || status === 0 || msg.includes("network");
+      if (!transient || i === times) break;
+      await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, i))); // exp backoff
+    }
+  }
+  throw lastErr;
 }
 
-export interface AuthState {
-  user: User | null;
-  loading: boolean;
-  initialized: boolean;
+function buildRedirect(path: string) {
+  // Ensure this matches Supabase → Auth → Settings → Redirect URLs
+  const base =
+    import.meta?.env?.VITE_APP_URL ||
+    process.env.NEXT_PUBLIC_APP_URL ||
+    process.env.APP_URL ||
+    "http://localhost:5173";
+  return `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 }
 
-class AuthService {
-  private listeners: ((state: AuthState) => void)[] = [];
-  private state: AuthState = {
-    user: null,
-    loading: true,
-    initialized: false
-  };
+/** Parse both search & hash for Supabase link params */
+function getAuthURLParams() {
+  const search = new URLSearchParams(window.location.search);
+  const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
 
-  constructor() {
-    this.initialize();
+  // PKCE style
+  const code = search.get("code") || hash.get("code");
+
+  // Legacy style
+  const access_token = hash.get("access_token") || search.get("access_token");
+  const refresh_token = hash.get("refresh_token") || search.get("refresh_token");
+
+  // Common
+  const type = hash.get("type") || search.get("type"); // e.g., signup, recovery
+
+  return { code, access_token, refresh_token, type };
+}
+
+/** ───────────────────────────────────────────────────────────────
+ * Sign Up (handles existing email)
+ * ─────────────────────────────────────────────────────────────── */
+export async function signUpUser(email: string, password: string): Promise<AuthResult<{ userId?: string }>> {
+  if (!isValidEmail(email)) {
+    return { success: false, code: "INVALID_EMAIL", message: "Enter a valid email address." };
+  }
+  if (!isStrongPassword(password)) {
+    return { success: false, code: "WEAK_PASSWORD", message: "Password must be at least 8 characters." };
   }
 
-  private async initialize() {
-    try {
-      // Get current session
-      const { data: { session }, error } = await supabase.auth.getSession();
-      
-      if (error) {
-        console.error('Session error:', error);
-        this.setState({ user: null, loading: false, initialized: true });
-        return;
-      }
-
-      if (session?.user) {
-        await this.loadUserProfile(session.user.id);
-      } else {
-        this.setState({ user: null, loading: false, initialized: true });
-      }
-      
-      // Listen for auth changes
-      supabase.auth.onAuthStateChange(async (event, session) => {
-        console.log('Auth state changed:', event, session?.user?.email);
-        
-        if (event === 'SIGNED_IN' && session?.user) {
-          await this.loadUserProfile(session.user.id);
-        } else if (event === 'SIGNED_OUT') {
-          this.setState({ user: null, loading: false, initialized: true });
-        } else if (event === 'TOKEN_REFRESHED' && session?.user) {
-          await this.loadUserProfile(session.user.id);
-        } else if (event === 'USER_UPDATED' && session?.user) {
-          // Handle user update - reload profile
-          await this.loadUserProfile(session.user.id);
-        }
-      });
-    } catch (error) {
-      console.error('Auth initialization error:', error);
-      this.setState({ user: null, loading: false, initialized: true });
-    }
-  }
-
-  private async loadUserProfile(userId: string) {
-    try {
-      // First get the auth user
-      const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
-      
-      if (authError || !authUser) {
-        console.error('Auth user error:', authError);
-        this.setState({ user: null, loading: false, initialized: true });
-        return;
-      }
-
-      // Try to get existing profile
-      const { data: profile, error: profileError } = await supabase
-        .from('user_profiles')
-        .select('*')
-        .eq('id', userId)
-        .single();
-
-      if (profileError && profileError.code === 'PGRST116') {
-        // Profile doesn't exist, create it
-        console.log('Creating new user profile for:', authUser.email);
-        const newProfile = await this.createUserProfile(authUser);
-        this.setState({ user: newProfile, loading: false, initialized: true });
-      } else if (profile) {
-        // Profile exists, check and reset credits if needed
-        const updatedProfile = await this.checkAndResetCredits(profile);
-        this.setState({ user: updatedProfile, loading: false, initialized: true });
-      } else {
-        console.error('Profile error:', profileError);
-        this.setState({ user: null, loading: false, initialized: true });
-      }
-    } catch (error) {
-      console.error('Error loading user profile:', error);
-      this.setState({ user: null, loading: false, initialized: true });
-    }
-  }
-
-  private async createUserProfile(authUser: any): Promise<User> {
-    const now = new Date().toISOString();
-
-    const profile = {
-      id: authUser.id,
-      email: authUser.email || '',
-      name: authUser.user_metadata?.full_name || authUser.user_metadata?.name || (authUser.email ? authUser.email.split('@')[0] : 'User'),
-      avatar_url: authUser.user_metadata?.avatar_url || null,
-      credits: 5,
-      credits_reset_at: null, // No reset time until credits are exhausted
-      created_at: now,
-      last_login: now,
-      profile_completed: false,
-      subscription_type: 'free' as const
-    };
-
-    try {
-      const { data, error } = await supabase
-        .from('user_profiles')
-        .insert(profile)
-        .select()
-        .single();
-
-      if (error) {
-        console.error('Error creating profile:', error);
-        // If profile already exists, try to fetch it
-        if (error.code === '23505') { // Unique constraint violation
-          const { data: existingProfile } = await supabase
-            .from('user_profiles')
-            .select('*')
-            .eq('id', authUser.id)
-            .single();
-          
-          if (existingProfile) {
-            return existingProfile;
-          }
-        }
-        throw error;
-      }
-
-      return data;
-    } catch (error) {
-      console.error('Profile creation failed:', error);
-      // Return a minimal profile object to prevent infinite loading
-      return {
-        id: authUser.id,
-        email: authUser.email || '',
-        name: authUser.user_metadata?.full_name || authUser.user_metadata?.name || (authUser.email ? authUser.email.split('@')[0] : 'User'),
-        avatar_url: authUser.user_metadata?.avatar_url,
-        credits: 5,
-        credits_reset_at: null,
-        created_at: now,
-        last_login: now,
-        profile_completed: false,
-        subscription_type: 'free' as const
-      };
-    }
-  }
-
-  private async checkAndResetCredits(profile: User): Promise<User> {
-    const now = new Date();
-    
-    // Only check reset if credits are 0 and reset_at is set
-    if (profile.credits === 0 && profile.credits_reset_at) {
-      const resetTime = new Date(profile.credits_reset_at);
-      
-      if (now > resetTime) {
-        // Reset credits and clear reset time
-        const maxCredits = profile.subscription_type === 'premium' ? 50 : 5;
-        
-        const { data, error } = await supabase
-          .from('user_profiles')
-          .update({
-            credits: maxCredits,
-            credits_reset_at: null, // Clear reset time
-            last_login: new Date().toISOString()
-          })
-          .eq('id', profile.id)
-          .select()
-          .single();
-
-        if (error) {
-          console.error('Error resetting credits:', error);
-          return profile;
-        }
-
-        return data;
-      }
-    }
-
-    // Just update last login
-    const { data, error } = await supabase
-      .from('user_profiles')
-      .update({ last_login: new Date().toISOString() })
-      .eq('id', profile.id)
-      .select()
-      .single();
-
-    return error ? profile : data;
-  }
-
-  private setState(newState: Partial<AuthState>) {
-    this.state = { ...this.state, ...newState };
-    console.log('Auth state updated:', this.state);
-    this.listeners.forEach(listener => listener(this.state));
-  }
-
-  subscribe(listener: (state: AuthState) => void) {
-    this.listeners.push(listener);
-    // Immediately call with current state
-    listener(this.state);
-    
-    return () => {
-      this.listeners = this.listeners.filter(l => l !== listener);
-    };
-  }
-
-  getState(): AuthState {
-    return this.state;
-  }
-
-  // Check if email exists in our database
-  async checkEmailExists(email: string): Promise<{ exists: boolean; error?: any }> {
-    try {
-      const { error } = await supabase
-        .from('user_profiles')
-        .select('email')
-        .eq('email', email.toLowerCase().trim())
-        .single();
-      
-      if (error && error.code === 'PGRST116') {
-        // Email not found
-        return { exists: false };
-      }
-      
-      if (error) {
-        return { exists: false, error };
-      }
-      
-      return { exists: true };
-    } catch (error) {
-      return { exists: false, error };
-    }
-  }
-
-  async signInWithEmail(email: string, password: string) {
-    try {
-      this.setState({ ...this.state, loading: true });
-      
-      // Let Supabase handle the authentication directly
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email: email.toLowerCase().trim(),
-        password
-      });
-
-      if (error) {
-        this.setState({ ...this.state, loading: false });
-        
-        // Provide more specific error messages
-        let userFriendlyMessage = 'Sign in failed. Please try again.';
-        
-        if (error.message?.includes('Invalid login credentials') || error.message?.includes('invalid_credentials')) {
-          userFriendlyMessage = 'Invalid email or password. Please check your credentials and try again.';
-        } else if (error.message?.includes('Email not confirmed')) {
-          userFriendlyMessage = 'Please check your email and click the confirmation link before signing in.';
-        } else if (error.message?.includes('Too many requests')) {
-          userFriendlyMessage = 'Too many sign-in attempts. Please wait a few minutes before trying again.';
-        } else if (error.message?.includes('User not found')) {
-          userFriendlyMessage = 'No account found with this email. Please sign up first.';
-        }
-        
-        return { 
-          data: null, 
-          error: { ...error, message: userFriendlyMessage }
-        };
-      }
-
-      // Don't set loading to false here - let the auth state change handler do it
-      return { data, error: null };
-    } catch (error: any) {
-      this.setState({ ...this.state, loading: false });
-      return { 
-        data: null, 
-        error: { message: 'An unexpected error occurred. Please try again.' }
-      };
-    }
-  }
-
-  async signUpWithEmail(email: string, password: string, name: string) {
-    try {
-      this.setState({ ...this.state, loading: true });
-      
-      const { data, error } = await supabase.auth.signUp({
-        email: email.toLowerCase().trim(),
+  try {
+    const { data, error } = await withRetry(() =>
+      supabase.auth.signUp({
+        email,
         password,
-        options: {
-          data: {
-            full_name: name.trim(),
-            name: name.trim()
-          },
-          emailRedirectTo: `${window.location.origin}/auth/confirm`
-        }
-      });
+        // Optionally preconfigure flow metadata here
+      })
+    );
 
-      if (error) {
-        this.setState({ ...this.state, loading: false });
-        
-        // Provide more specific error messages
-        let userFriendlyMessage = 'Sign up failed. Please try again.';
-        
-        if (error.message?.includes('Password should be at least')) {
-          userFriendlyMessage = 'Password must be at least 6 characters long.';
-        } else if (error.message?.includes('Invalid email')) {
-          userFriendlyMessage = 'Please enter a valid email address.';
-        } else if (error.message?.includes('User already registered') || error.message?.includes('already been registered')) {
-          userFriendlyMessage = 'An account with this email already exists. Please sign in instead.';
-        } else if (error.message?.includes('Unable to validate email')) {
-          userFriendlyMessage = 'Unable to validate email. Please check the format and try again.';
-        }
-        
-        return { 
-          data: null, 
-          error: { ...error, message: userFriendlyMessage }
-        };
-      }
-
-      // Always require email confirmation
-      this.setState({ ...this.state, loading: false });
-      
-      return { data, error: null };
-    } catch (error: any) {
-      this.setState({ ...this.state, loading: false });
-      return { 
-        data: null, 
-        error: { message: 'An unexpected error occurred. Please try again.' }
-      };
+    if (error) {
+      const { code, message } = normalizeError(error);
+      return { success: false, code, message, raw: error };
     }
-  }
 
-  async signInWithGoogle() {
-    try {
-      this.setState({ ...this.state, loading: true });
+    // Create user profile with 5 credits and 24-hour reset
+    if (data?.user?.id) {
+      const resetTime = new Date();
+      resetTime.setHours(resetTime.getHours() + 24);
       
-      const { data, error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: `${window.location.origin}`,
-          queryParams: {
-            access_type: 'offline',
-            prompt: 'consent',
-          }
-        }
-      });
-
-      if (error) {
-        this.setState({ ...this.state, loading: false });
-        return { data: null, error };
-      }
-
-      return { data, error: null };
-    } catch (error: any) {
-      this.setState({ ...this.state, loading: false });
-      return { data: null, error };
-    }
-  }
-
-  async signOut() {
-    try {
-      // Immediately clear state for instant UI update
-      this.setState({ user: null, loading: false, initialized: true });
-      
-      // DON'T clear guest credits on logout - they should persist
-      // localStorage.removeItem('guest_credit_used'); // REMOVED
-      
-      // Sign out from Supabase in background
-      supabase.auth.signOut().catch(console.error);
-      
-      return { error: null };
-    } catch (error: any) {
-      return { error };
-    }
-  }
-
-  async resetPassword(email: string) {
-    try {
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${window.location.origin}/auth/reset-password`
-      });
-
-      if (error) {
-        return { error: { message: 'Password reset failed. Please try again.' } };
-      }
-
-      return { error: null };
-    } catch (error: any) {
-      return { error: { message: 'An unexpected error occurred. Please try again.' } };
-    }
-  }
-
-  async updateProfile(updates: Partial<Pick<User, 'name' | 'avatar_url'>>) {
-    if (!this.state.user) throw new Error('No user logged in');
-
-    try {
-      const { data, error } = await supabase
+      const { error: profileError } = await supabase
         .from('user_profiles')
-        .update(updates)
-        .eq('id', this.state.user.id)
-        .select()
-        .single();
-
-      if (error) throw error;
+        .insert({
+          user_id: data.user.id,
+          email: email,
+          credits: 5,
+          credits_reset_at: resetTime.toISOString()
+        });
       
-      this.setState({ user: data });
-      return { data, error: null };
-    } catch (error: any) {
-      return { data: null, error };
-    }
-  }
-
-  async useCredit(): Promise<boolean> {
-    if (!this.state.user) return false;
-
-    const user = this.state.user;
-    if (user.credits <= 0) return false;
-
-    try {
-      const newCredits = user.credits - 1;
-      const updateData: any = { credits: newCredits };
-      
-      // If this is the last credit, set reset timer
-      if (newCredits === 0) {
-        updateData.credits_reset_at = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+      if (profileError) {
+        console.error('Error creating user profile:', profileError);
       }
-
-      const { data, error } = await supabase
-        .from('user_profiles')
-        .update(updateData)
-        .eq('id', user.id)
-        .select()
-        .single();
-
-      if (error) {
-        console.error('Error using credit:', error);
-        return false;
-      }
-      
-      this.setState({ user: data });
-      return true;
-    } catch (error) {
-      console.error('Error using credit:', error);
-      return false;
-    }
-  }
-
-  getGuestCredits(): number {
-    const lastUsed = localStorage.getItem('guest_credit_used');
-    if (!lastUsed) return 1;
-
-    const lastUsedTime = new Date(lastUsed);
-    const now = new Date();
-    const timeDiff = now.getTime() - lastUsedTime.getTime();
-    const hoursDiff = timeDiff / (1000 * 60 * 60);
-
-    if (hoursDiff >= 3) {
-      localStorage.removeItem('guest_credit_used');
-      return 1;
     }
 
-    return 0;
-  }
-
-  useGuestCredit(): boolean {
-    const credits = this.getGuestCredits();
-    if (credits > 0) {
-      localStorage.setItem('guest_credit_used', new Date().toISOString());
-      return true;
-    }
-    return false;
-  }
-
-  hasCredits(): boolean {
-    if (this.state.user) {
-      return this.state.user.credits > 0;
-    }
-    return this.getGuestCredits() > 0;
-  }
-
-  getCreditsInfo(): { credits: number; isGuest: boolean; resetTime?: string } {
-    if (this.state.user) {
-      return {
-        credits: this.state.user.credits,
-        isGuest: false,
-        resetTime: this.state.user.credits_reset_at || undefined
-      };
-    }
-    
     return {
-      credits: this.getGuestCredits(),
-      isGuest: true
+      success: true,
+      message: "Account created. Check your email to confirm your account.",
+      data: { userId: data?.user?.id },
     };
+  } catch (err: any) {
+    const { code, message } = normalizeError(err);
+    return { success: false, code, message, raw: err };
   }
 }
 
-export const authService = new AuthService();
+/** ───────────────────────────────────────────────────────────────
+ * Sign In (handles invalid credentials, unconfirmed email, rate limits)
+ * ─────────────────────────────────────────────────────────────── */
+export async function signInUser(email: string, password: string): Promise<AuthResult<{ userId?: string }>> {
+  if (!isValidEmail(email)) {
+    return { success: false, code: "INVALID_EMAIL", message: "Enter a valid email address." };
+  }
+
+  try {
+    const { data, error } = await withRetry(() =>
+      supabase.auth.signInWithPassword({ email, password })
+    );
+
+    if (error) {
+      const { code, message } = normalizeError(error);
+      return { success: false, code, message, raw: error };
+    }
+
+    return { success: true, message: "Login successful.", data: { userId: data?.user?.id } };
+  } catch (err: any) {
+    const { code, message } = normalizeError(err);
+    return { success: false, code, message, raw: err };
+  }
+}
+
+/** ───────────────────────────────────────────────────────────────
+ * Password Reset: send email
+ * ─────────────────────────────────────────────────────────────── */
+/**
+ * Request a Password Reset Link
+ * Sends a reset email to the user
+ */
+export async function sendPasswordReset(email: string) {
+  try {
+    const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: `${window.location.origin}/reset-password`,
+    });
+
+    if (error) {
+      return { success: false, message: error.message };
+    }
+
+    return { success: true, message: "Password reset link has been sent to your email." };
+  } catch (err) {
+    console.error("Unexpected error in requestPasswordReset:", err);
+    return { success: false, message: "Something went wrong. Please try again later." };
+  }
+}
+
+/** ───────────────────────────────────────────────────────────────
+ * Password Recovery Callback:
+ * - Call this on your /reset-password route load
+ * - Supports both PKCE (?code=...) and legacy (#access_token=...)
+ * - Returns a specific state to drive UI
+ * ─────────────────────────────────────────────────────────────── */
+export type RecoveryInitResult =
+  | { state: "PASSWORD_RECOVERY_READY" }
+  | { state: "EMAIL_CONFIRMED"; message?: string }
+  | { state: "NO_ACTION" }
+  | { state: "ERROR"; code: AuthErrorCode; message: string; raw?: unknown };
+
+export async function initAuthFromURL(): Promise<RecoveryInitResult> {
+  // For password reset, just check if we're on the reset page
+  if (window.location.pathname === '/reset-password') {
+    return { state: "PASSWORD_RECOVERY_READY" };
+  }
+  return { state: "NO_ACTION" };
+}
+
+/** ───────────────────────────────────────────────────────────────
+ * Update Password (after recovery init)
+ * - Call on your reset form submit
+ * ─────────────────────────────────────────────────────────────── */
+/**
+ * Update Password (After Clicking Reset Link)
+ * Supabase will auto-sign-in the user after clicking reset link
+ */
+export async function updatePassword(newPassword: string) {
+  try {
+    const { data, error } = await supabase.auth.updateUser({
+      password: newPassword,
+    });
+
+    if (error) {
+      return { success: false, message: error.message };
+    }
+
+    return { success: true, message: "Password has been reset successfully." };
+  } catch (err) {
+    console.error("Unexpected error in updatePassword:", err);
+    return { success: false, message: "Something went wrong. Please try again later." };
+  }
+}
